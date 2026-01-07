@@ -12,6 +12,7 @@ public final class AudioNormalizationService: Sendable {
         case peak(targetDB: Float)  // Default: -0.1 dB (prevents clipping)
         case rms(targetDB: Float)   // Default: -20 dB (typical speech level)
         case lufs(targetLUFS: Float, truePeakLimit: Float = -1.0)  // EBU R128: -14 LUFS (Spotify), -16 (Apple), -23 (broadcast)
+        case dynamic(config: DynamicNormalizationConfig)  // Frame-by-frame gain for even volume (voice/meditation)
     }
     
     public enum NormalizationError: Error, Sendable {
@@ -29,16 +30,69 @@ public final class AudioNormalizationService: Sendable {
         public let rmsLevel: Float         // RMS level (0.0 to 1.0)
         public let peakDB: Float           // Sample peak in dB
         public let rmsDB: Float            // RMS in dB
-        public let requiredGain: Float     // Gain multiplier needed
+        public let requiredGain: Float     // Gain multiplier needed (average for dynamic)
         public let channelCount: Int       // Number of audio channels (1=mono, 2=stereo)
         public let perChannelPeakDB: [Float]  // Peak levels per channel in dB
         public let perChannelRmsDB: [Float]   // RMS levels per channel in dB
-        
+
         // LUFS measurements (ITU-R BS.1770-4 / EBU R128)
         public let integratedLUFS: Float   // Integrated loudness (gated)
         public let truePeakDB: Float       // True peak (4x oversampled)
         public let shortTermLUFS: Float?   // Short-term loudness (3s window), nil if audio < 3s
         public let loudnessRange: Float?   // LRA in LU (optional)
+
+        // Dynamic normalization analysis (nil for static methods)
+        public let dynamicAnalysis: DynamicNormalizer.AnalysisResult?
+
+        // Normalization preview (before/after comparison)
+        public let preview: NormalizationPreview?
+    }
+
+    /// Before/after comparison for normalization preview
+    public struct NormalizationPreview: Sendable {
+        /// Method being applied
+        public let method: String
+
+        /// Current state (before normalization)
+        public let before: LevelInfo
+
+        /// Expected state (after normalization)
+        public let after: LevelInfo
+
+        /// Gain that will be applied (in dB)
+        public let gainDB: Float
+
+        /// For dynamic: problem spots count
+        public let problemSpotsCount: Int
+
+        /// Level information
+        public struct LevelInfo: Sendable {
+            public let peakDB: Float
+            public let rmsDB: Float
+            public let lufs: Float?
+            public let truePeakDB: Float?
+
+            public init(peakDB: Float, rmsDB: Float, lufs: Float? = nil, truePeakDB: Float? = nil) {
+                self.peakDB = peakDB
+                self.rmsDB = rmsDB
+                self.lufs = lufs
+                self.truePeakDB = truePeakDB
+            }
+        }
+
+        public init(
+            method: String,
+            before: LevelInfo,
+            after: LevelInfo,
+            gainDB: Float,
+            problemSpotsCount: Int = 0
+        ) {
+            self.method = method
+            self.before = before
+            self.after = after
+            self.gainDB = gainDB
+            self.problemSpotsCount = problemSpotsCount
+        }
     }
     
     // MARK: - Initialization
@@ -72,19 +126,32 @@ public final class AudioNormalizationService: Sendable {
         // Step 1: Analyze audio to determine normalization parameters
         progressHandler?(0.1)
         let analysis = try await analyzeAudio(at: inputURL, method: method)
-        
+
         // Step 2: Apply normalization
         progressHandler?(0.3)
-        try await applyNormalization(
-            inputURL: inputURL,
-            outputURL: outputURL,
-            gain: analysis.requiredGain,
-            progressHandler: { progress in
-                // Map 0.0-1.0 to 0.3-1.0 range
-                progressHandler?(0.3 + (progress * 0.7))
-            }
-        )
-        
+
+        // Dynamic normalization requires different approach (per-sample gains)
+        if case .dynamic = method, let dynamicAnalysis = analysis.dynamicAnalysis {
+            try await applyDynamicNormalization(
+                inputURL: inputURL,
+                outputURL: outputURL,
+                dynamicAnalysis: dynamicAnalysis,
+                progressHandler: { progress in
+                    progressHandler?(0.3 + (progress * 0.7))
+                }
+            )
+        } else {
+            try await applyNormalization(
+                inputURL: inputURL,
+                outputURL: outputURL,
+                gain: analysis.requiredGain,
+                progressHandler: { progress in
+                    // Map 0.0-1.0 to 0.3-1.0 range
+                    progressHandler?(0.3 + (progress * 0.7))
+                }
+            )
+        }
+
         progressHandler?(1.0)
         return analysis
     }
@@ -244,11 +311,13 @@ public final class AudioNormalizationService: Sendable {
         
         // Calculate required gain based on method
         let requiredGain: Float
+        var dynamicResult: DynamicNormalizer.AnalysisResult? = nil
+
         switch method {
         case .peak(let targetDB):
             let gainDB = targetDB - peakDB
             requiredGain = pow(10, gainDB / 20.0)
-            
+
         case .rms(let targetDB):
             let gainDB = targetDB - rmsDB
             var gain = pow(10, gainDB / 20.0)
@@ -256,7 +325,7 @@ public final class AudioNormalizationService: Sendable {
             let maxAllowedGain = pow(10, (-0.1 - peakDB) / 20.0)
             gain = min(gain, maxAllowedGain)
             requiredGain = gain
-            
+
         case .lufs(let targetLUFS, let truePeakLimit):
             // Calculate gain based on LUFS difference
             let currentLUFS = lufsResult.integratedLUFS
@@ -266,7 +335,7 @@ public final class AudioNormalizationService: Sendable {
             }
             let gainDB = targetLUFS - currentLUFS
             var gain = pow(10, gainDB / 20.0)
-            
+
             // Limit gain to respect true peak limit
             let currentTruePeak = truePeakResult.truePeakDB
             if currentTruePeak > -Float.infinity {
@@ -274,8 +343,31 @@ public final class AudioNormalizationService: Sendable {
                 gain = min(gain, maxGainForTruePeak)
             }
             requiredGain = gain
+
+        case .dynamic(let config):
+            // Dynamic normalization: frame-by-frame gain adjustment
+            let dynamicNormalizer = DynamicNormalizer(
+                config: config,
+                sampleRate: sampleRate,
+                channelCount: channelCount
+            )
+            dynamicResult = dynamicNormalizer.analyze(samples: allSamples)
+            // Use average gain for reporting
+            let avgGain = dynamicResult!.finalGains.reduce(0, +) / Float(dynamicResult!.finalGains.count)
+            requiredGain = avgGain
         }
-        
+
+        // Build normalization preview (before/after comparison)
+        let preview = buildPreview(
+            method: method,
+            peakDB: peakDB,
+            rmsDB: rmsDB,
+            lufs: lufsResult.integratedLUFS,
+            truePeakDB: truePeakResult.truePeakDB,
+            requiredGain: requiredGain,
+            dynamicResult: dynamicResult
+        )
+
         return AudioAnalysis(
             peakLevel: peakValue,
             rmsLevel: rmsValue,
@@ -288,7 +380,78 @@ public final class AudioNormalizationService: Sendable {
             integratedLUFS: lufsResult.integratedLUFS,
             truePeakDB: truePeakResult.truePeakDB,
             shortTermLUFS: lufsResult.shortTermLUFS,
-            loudnessRange: lufsResult.loudnessRange
+            loudnessRange: lufsResult.loudnessRange,
+            dynamicAnalysis: dynamicResult,
+            preview: preview
+        )
+    }
+
+    /// Build normalization preview with before/after comparison
+    private func buildPreview(
+        method: NormalizationMethod,
+        peakDB: Float,
+        rmsDB: Float,
+        lufs: Float,
+        truePeakDB: Float,
+        requiredGain: Float,
+        dynamicResult: DynamicNormalizer.AnalysisResult?
+    ) -> NormalizationPreview {
+        let gainDB = 20 * log10(max(requiredGain, 1e-10))
+
+        let before = NormalizationPreview.LevelInfo(
+            peakDB: peakDB,
+            rmsDB: rmsDB,
+            lufs: lufs > -Float.infinity ? lufs : nil,
+            truePeakDB: truePeakDB > -Float.infinity ? truePeakDB : nil
+        )
+
+        let methodName: String
+        let expectedPeakDB: Float
+        let expectedRmsDB: Float
+        var expectedLufs: Float? = nil
+        var expectedTruePeak: Float? = nil
+        var problemSpotsCount = 0
+
+        switch method {
+        case .peak(let targetDB):
+            methodName = "Peak (\(String(format: "%.1f", targetDB)) dB)"
+            expectedPeakDB = targetDB
+            expectedRmsDB = rmsDB + gainDB
+
+        case .rms(let targetDB):
+            methodName = "RMS (\(String(format: "%.1f", targetDB)) dB)"
+            expectedPeakDB = peakDB + gainDB
+            expectedRmsDB = targetDB
+
+        case .lufs(let targetLUFS, let truePeakLimit):
+            methodName = "LUFS (\(String(format: "%.1f", targetLUFS)) LUFS)"
+            expectedPeakDB = peakDB + gainDB
+            expectedRmsDB = rmsDB + gainDB
+            expectedLufs = targetLUFS
+            expectedTruePeak = min(truePeakDB + gainDB, truePeakLimit)
+
+        case .dynamic(let config):
+            methodName = "Dynamic (target \(String(format: "%.0f", config.targetRMSdB)) dB)"
+            expectedPeakDB = peakDB + gainDB  // Approximate
+            expectedRmsDB = config.targetRMSdB  // Target RMS
+            if let result = dynamicResult {
+                problemSpotsCount = result.problemSpots.count
+            }
+        }
+
+        let after = NormalizationPreview.LevelInfo(
+            peakDB: expectedPeakDB,
+            rmsDB: expectedRmsDB,
+            lufs: expectedLufs,
+            truePeakDB: expectedTruePeak
+        )
+
+        return NormalizationPreview(
+            method: methodName,
+            before: before,
+            after: after,
+            gainDB: gainDB,
+            problemSpotsCount: problemSpotsCount
         )
     }
     
@@ -394,7 +557,180 @@ public final class AudioNormalizationService: Sendable {
             throw writer.error ?? NormalizationError.processingFailed("Writer failed")
         }
     }
-    
+
+    /// Apply dynamic normalization with per-sample interpolated gains
+    private func applyDynamicNormalization(
+        inputURL: URL,
+        outputURL: URL,
+        dynamicAnalysis: DynamicNormalizer.AnalysisResult,
+        progressHandler: (@Sendable (Double) -> Void)?
+    ) async throws {
+        let asset = AVURLAsset(url: inputURL)
+
+        // Load tracks and duration
+        let tracks = try await asset.loadTracks(withMediaType: .audio)
+        guard let audioTrack = tracks.first else {
+            throw NormalizationError.noAudioTrack
+        }
+
+        let duration = try await asset.load(.duration)
+        let durationSeconds = duration.seconds
+
+        let formatDescriptions = try await audioTrack.load(.formatDescriptions)
+        guard let audioFormat = formatDescriptions.first else {
+            throw NormalizationError.noAudioTrack
+        }
+
+        let audioStreamBasic = CMAudioFormatDescriptionGetStreamBasicDescription(audioFormat)
+        let sampleRate = audioStreamBasic?.pointee.mSampleRate ?? 44100.0
+        let channels = audioStreamBasic?.pointee.mChannelsPerFrame ?? 2
+
+        // Create asset reader
+        guard let reader = try? AVAssetReader(asset: asset) else {
+            throw NormalizationError.assetReaderCreationFailed
+        }
+
+        let outputSettings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVLinearPCMBitDepthKey: 32,
+            AVLinearPCMIsFloatKey: true,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsNonInterleaved: false
+        ]
+
+        let readerOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: outputSettings)
+        reader.add(readerOutput)
+
+        // Create asset writer
+        guard let writer = try? AVAssetWriter(outputURL: outputURL, fileType: .m4a) else {
+            throw NormalizationError.assetWriterCreationFailed
+        }
+
+        let writerSettings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: sampleRate,
+            AVNumberOfChannelsKey: channels,
+            AVEncoderBitRateKey: 128000
+        ]
+
+        let writerInput = AVAssetWriterInput(mediaType: .audio, outputSettings: writerSettings)
+        writerInput.expectsMediaDataInRealTime = false
+        writer.add(writerInput)
+
+        guard reader.startReading(), writer.startWriting() else {
+            throw NormalizationError.processingFailed("Failed to start reading/writing")
+        }
+
+        writer.startSession(atSourceTime: .zero)
+
+        // Track global sample position for gain interpolation
+        var globalSampleIndex = 0
+        let frameSize = dynamicAnalysis.frameSizeSamples
+        let gains = dynamicAnalysis.finalGains
+
+        while let sampleBuffer = readerOutput.copyNextSampleBuffer() {
+            while !writerInput.isReadyForMoreMediaData {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+
+            // Apply interpolated gains to this buffer
+            guard let normalizedBuffer = applyDynamicGain(
+                to: sampleBuffer,
+                gains: gains,
+                frameSize: frameSize,
+                startingSampleIndex: globalSampleIndex
+            ) else {
+                writer.cancelWriting()
+                throw NormalizationError.processingFailed("Failed to apply dynamic gain")
+            }
+
+            // Update global sample index
+            let bufferSampleCount = CMSampleBufferGetNumSamples(sampleBuffer) * Int(channels)
+            globalSampleIndex += bufferSampleCount
+
+            writerInput.append(normalizedBuffer)
+
+            let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
+            let progress = min(timestamp / durationSeconds, 1.0)
+            progressHandler?(progress)
+        }
+
+        writerInput.markAsFinished()
+
+        if reader.status == .failed {
+            writer.cancelWriting()
+            throw reader.error ?? NormalizationError.processingFailed("Reader failed")
+        }
+
+        await writer.finishWriting()
+
+        if writer.status == .failed {
+            throw writer.error ?? NormalizationError.processingFailed("Writer failed")
+        }
+    }
+
+    /// Apply interpolated dynamic gains to a sample buffer
+    private func applyDynamicGain(
+        to sampleBuffer: CMSampleBuffer,
+        gains: [Float],
+        frameSize: Int,
+        startingSampleIndex: Int
+    ) -> CMSampleBuffer? {
+        guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else {
+            return nil
+        }
+
+        var length: Int = 0
+        var dataPointer: UnsafeMutablePointer<Int8>?
+
+        let status = CMBlockBufferGetDataPointer(
+            blockBuffer,
+            atOffset: 0,
+            lengthAtOffsetOut: nil,
+            totalLengthOut: &length,
+            dataPointerOut: &dataPointer
+        )
+
+        guard status == noErr, let data = dataPointer else {
+            return nil
+        }
+
+        let sampleCount = length / MemoryLayout<Float>.size
+
+        data.withMemoryRebound(to: Float.self, capacity: sampleCount) { floatPointer in
+            for i in 0..<sampleCount {
+                let globalIdx = startingSampleIndex + i
+                let framePosition = Float(globalIdx) / Float(frameSize)
+                let frameIndex = Int(framePosition)
+                let fractional = framePosition - Float(frameIndex)
+
+                // Get gains for interpolation
+                let currentGain: Float
+                let nextGain: Float
+
+                if gains.isEmpty {
+                    currentGain = 1.0
+                    nextGain = 1.0
+                } else if frameIndex >= gains.count - 1 {
+                    currentGain = gains[gains.count - 1]
+                    nextGain = currentGain
+                } else if frameIndex < 0 {
+                    currentGain = gains[0]
+                    nextGain = currentGain
+                } else {
+                    currentGain = gains[frameIndex]
+                    nextGain = gains[min(frameIndex + 1, gains.count - 1)]
+                }
+
+                // Linear interpolation
+                let interpolatedGain = currentGain + (nextGain - currentGain) * fractional
+                floatPointer[i] *= interpolatedGain
+            }
+        }
+
+        return sampleBuffer
+    }
+
     private func applySampleGain(to sampleBuffer: CMSampleBuffer, gain: Float) -> CMSampleBuffer? {
         guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else {
             return nil
